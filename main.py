@@ -7,9 +7,44 @@ import threading
 import queue
 from dotenv import load_dotenv
 import speech_recognition as sr
-import pyttsx3;
+import pyttsx3
+import subprocess
+import sys
+import json
+import re
 
-engine = pyttsx3.init()  # ONE-LINE TTS SETUP
+# ============= TTS SYSTEM =============
+class TTSManager:
+    """Manages Text-to-Speech for consistent audio output"""
+    def __init__(self):
+        self.use_windows_tts = sys.platform == "win32"
+        if not self.use_windows_tts:
+            self.engine = pyttsx3.init()
+            self.engine.setProperty('rate', 150)
+            self.engine.setProperty('volume', 0.9)
+    
+    def speak(self, text):
+        """Speak text using best available method"""
+        if not text or len(text.strip()) == 0:
+            return
+        
+        try:
+            if self.use_windows_tts:
+                # Use Windows built-in TTS (more reliable)
+                subprocess.run([
+                    'PowerShell', '-Command',
+                    f'Add-Type -AssemblyName System.Speech; '
+                    f'$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+                    f'$speak.Speak("{text.replace('"', '\\"')}")'
+                ], timeout=30)
+            else:
+                # Use pyttsx3 for other systems
+                self.engine.say(text)
+                self.engine.runAndWait()
+        except Exception as e:
+            print(f"⚠️ TTS Error: {e}")
+
+tts_manager = TTSManager()
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +75,46 @@ voice_recognizer.pause_threshold = 0.8
 voice_recognizer.phrase_time_limit = 8
 
 
+def format_output(text, max_width=80):
+    """Format API response cleanly without JSON glitches"""
+    if not text:
+        return "[No response]"
+    
+    # Try to parse as JSON if it looks like JSON
+    if text.strip().startswith('{') or text.strip().startswith('['):
+        try:
+            parsed = json.loads(text)
+            # Pretty print JSON with proper formatting
+            formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
+            return formatted
+        except (json.JSONDecodeError, ValueError):
+            # If JSON parsing fails, clean the text
+            pass
+    
+    # Clean up text: remove extra escape characters, newlines, etc
+    text = text.replace('\\n', '\n').replace('\\"', '"').replace("\\", "")
+    text = re.sub(r'\s+', ' ', text)  # Collapse multiple spaces
+    
+    # Word wrap for better display
+    words = text.split(' ')
+    lines = []
+    current_line = []
+    
+    for word in words:
+        if len(' '.join(current_line + [word])) <= max_width:
+            current_line.append(word)
+        else:
+            if current_line:
+                lines.append(' '.join(current_line))
+            current_line = [word]
+    
+    if current_line:
+        lines.append(' '.join(current_line))
+    
+    return '\n'.join(lines)
+
+
+
 def analyze_frame(image_path, prompt="Briefly describe what you see"):
     """Analyze frame with Gemini"""
     try:
@@ -53,7 +128,10 @@ def analyze_frame(image_path, prompt="Briefly describe what you see"):
 
         if not response.text:
             return "Error: No response text generated (possibly blocked)"
-        return response.text
+        
+        # Clean and format the response
+        clean_text = format_output(response.text)
+        return clean_text
 
     except Exception as e:
         return f"Error analyzing frame: {str(e)}"
@@ -178,13 +256,25 @@ def show_camera_feed_with_capture(capture_interval=60):
                 resized_frame = cv2.resize(latest_frame, (TARGET_WIDTH, TARGET_HEIGHT))
                 cv2.imwrite(filename, resized_frame)
 
-            print(f"\n🔍 [ON-DEMAND] {filename}")
+            print(f"\n{'='*60}")
+            print(f"🔍 [ON-DEMAND] {filename}")
+            print(f"{'='*60}")
             description = analyze_frame(filename, prompt=user_prompt)
-            print(f"🤖 [ON-DEMAND] {description}\n")
+            print(f"🤖 RESPONSE:\n{description}")
+            print(f"{'='*60}\n")
 
-            # TTS for on-demand
-            engine.say(description)
-            engine.runAndWait()
+            # TTS for on-demand (extract clean text if JSON)
+            tts_text = description
+            if description.strip().startswith('{') or description.strip().startswith('['):
+                try:
+                    parsed = json.loads(description)
+                    if isinstance(parsed, dict):
+                        tts_text = ' '.join(str(v) for v in parsed.values())
+                    elif isinstance(parsed, list):
+                        tts_text = ' '.join(str(item) for item in parsed)
+                except:
+                    pass
+            tts_manager.speak(tts_text[:500])  # Limit TTS to 500 chars
 
         except queue.Empty:
             pass
@@ -197,13 +287,25 @@ def show_camera_feed_with_capture(capture_interval=60):
             resized_frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
             cv2.imwrite(filename, resized_frame)
 
-            print(f"\n📸 [AUTO] {filename}")
+            print(f"\n{'='*60}")
+            print(f"📸 [AUTO-CAPTURE] {filename}")
+            print(f"{'='*60}")
             description = analyze_frame(filename, prompt="Describe what you see in three descriptive sentences")
-            print(f"🤖 [AUTO] {description}\n")
+            print(f"🤖 RESPONSE:\n{description}")
+            print(f"{'='*60}\n")
 
-            # TTS for auto-capture (THIS WAS MISSING!)
-            engine.say(description);
-            engine.runAndWait()
+            # TTS for auto-capture (extract clean text if JSON)
+            tts_text = description
+            if description.strip().startswith('{') or description.strip().startswith('['):
+                try:
+                    parsed = json.loads(description)
+                    if isinstance(parsed, dict):
+                        tts_text = ' '.join(str(v) for v in parsed.values())
+                    elif isinstance(parsed, list):
+                        tts_text = ' '.join(str(item) for item in parsed)
+                except:
+                    pass
+            tts_manager.speak(tts_text[:500])  # Limit TTS to 500 chars
 
             last_capture_time = current_time
             photo_count += 1
