@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+AI Camera – Raspberry Pi OS edition
+Live CV window + voice prompts + Gemini + TTS
+FIXED: TTS now speaks every time using pyttsx3
+"""
+
 import cv2
 import time
 import base64
@@ -5,219 +12,193 @@ import google.generativeai as genai
 import os
 import threading
 import queue
+import json
+import re
+import sys
 from dotenv import load_dotenv
 import speech_recognition as sr
-import pyttsx3;
+import pyttsx3
 
-engine = pyttsx3.init()  # ONE-LINE TTS SETUP
+# ---------- TTS FIXED ----------
+class TTSManager:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
 
-# Load environment variables
+    def speak(self, txt):
+        self.queue.put(txt)  # Non-blocking, just adds to queue
+
+    def _worker(self):
+        engine = pyttsx3.init()  # Engine lives in background
+        while True:
+            txt = self.queue.get()
+            engine.say(txt)
+            engine.runAndWait()  # Blocks ONLY in worker thread
+tts = TTSManager()
+
+# ---------- Gemini ----------
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    raise ValueError("Please set GEMINI_API_KEY environment variable")
-
+    sys.exit("Set GEMINI_API_KEY env var or create .env file")
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Thread-safe communication
+# ---------- globals ----------
 prompt_queue = queue.Queue()
 latest_frame = None
 frame_lock = threading.Lock()
+TARGET_W, TARGET_H = 640, 480
 
-# Image settings
-TARGET_WIDTH = 640
-TARGET_HEIGHT = 480
+# ---------- SR ----------
+sr_energy = 1000
+sr_pause  = 0.8
+sr_phrase = 8
+recognizer = sr.Recognizer()
+mic = sr.Microphone(sample_rate=16000)
+recognizer.energy_threshold = sr_energy
+recognizer.pause_threshold  = sr_pause
+recognizer.operation_timeout = 10
+voice_evt = threading.Event()
 
-# Voice recognition globals
-voice_recognizer = sr.Recognizer()
-voice_microphone = sr.Microphone()
-voice_activation_event = threading.Event()
+# ---------- util ----------
+def format_resp(text, max_w=80):
+    if not text:
+        return "[No response]"
+    text = re.sub(r'\\n', '\n', text)
+    text = re.sub(r'\\"', '"', text)
+    text = re.sub(r'\s+', ' ', text)
+    words = text.split()
+    lines, cur = [], []
+    for w in words:
+        if len(' '.join(cur + [w])) <= max_w:
+            cur.append(w)
+        else:
+            lines.append(' '.join(cur))
+            cur = [w]
+    if cur:
+        lines.append(' '.join(cur))
+    return '\n'.join(lines)
 
-# Fine-tune microphone sensitivity
-voice_recognizer.energy_threshold = 1000
-voice_recognizer.pause_threshold = 0.8
-voice_recognizer.phrase_time_limit = 8
-
-
-def analyze_frame(image_path, prompt="Briefly describe what you see"):
-    """Analyze frame with Gemini"""
+def analyse(img_path, prompt="""Briefly describe what you see in 3 sentences or less. """):
     try:
-        with open(image_path, "rb") as f:
-            image_data = base64.b64encode(f.read()).decode()
-
-        response = model.generate_content([
-            {"mime_type": "image/jpeg", "data": image_data},
-            prompt
-        ])
-
-        if not response.text:
-            return "Error: No response text generated (possibly blocked)"
-        return response.text
-
+        with open(img_path, "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+        rsp = model.generate_content([{"mime_type": "image/jpeg", "data": data}, prompt])
+        return format_resp(rsp.text) if rsp.text else "[Empty response]"
     except Exception as e:
-        return f"Error analyzing frame: {str(e)}"
+        return f"Analysis error: {e}"
 
-
-def terminal_input_thread():
-    """Continuously listen for terminal input or voice trigger"""
-    print("\n" + "=" * 50)
-    print("📋 INPUT MODE ACTIVATED")
-    print("Options:")
-    print("  • Type a prompt + Enter → Text input")
-    print("  • Type 'v' + Enter → Voice input mode")
-    print("  • Press Ctrl+C to stop input mode")
-    print("=" * 50 + "\n")
-
+# ---------- threads ----------
+def terminal_thread():
+    print("\n" + "="*50)
+    print("📋 Terminal ready  –  type prompt | 'v' = voice | Ctrl-C quit")
+    print("="*50 + "\n")
     while True:
         try:
-            user_input = input("Enter prompt (or 'v' for voice): ").strip()
-
-            if user_input.lower() == 'v':
-                print("\n🎤 Activating voice recognition...")
-                voice_activation_event.set()
-            elif user_input:
-                prompt_queue.put(user_input)
-                print("⏳ Prompt queued - analyzing next available frame...\n")
-
+            inp = input("> ").strip()
+            if inp.lower() == 'v':
+                voice_evt.set()
+            elif inp:
+                prompt_queue.put(inp)
+                print("⏳ queued\n")
         except (KeyboardInterrupt, EOFError):
-            print("\n🛑 Terminal input mode stopped.")
+            print("\n🛑 terminal exit\n")
             break
 
-
-def voice_input_thread():
-    """Background thread for voice recognition (on-demand)"""
-
-    print("\n🎤 Calibrating microphone for ambient noise... (2 seconds)")
+def voice_thread():
+    print("🎤 Calibrating mic … stay quiet 2 s")
     try:
-        with voice_microphone as source:
-            voice_recognizer.adjust_for_ambient_noise(source, duration=2)
-        print("✅ Microphone calibration complete. Voice input ready.\n")
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=2)
+        print("✅ mic ready\n")
     except Exception as e:
-        print(f"❌ Microphone setup failed: {e}")
-        print("Voice input will be unavailable.\n")
-        return
+        print("❌ mic failed:", e); return
 
     while True:
-        # Wait for activation signal
-        voice_activation_event.wait()
-        voice_activation_event.clear()
-
+        voice_evt.wait(); voice_evt.clear()
         try:
-            # Listen to microphone
-            print("\n🎤 LISTENING... Speak your prompt now")
-            with voice_microphone as source:
-                audio = voice_recognizer.listen(source, timeout=10, phrase_time_limit=8)
-            print("⏳ Processing speech...")
-
-            # Transcribe
-            prompt_text = voice_recognizer.recognize_google(audio, language="en-US")
-            if prompt_text.strip():
-                print(f"✅ Heard: \"{prompt_text}\"\n")
-                prompt_queue.put(prompt_text)
-                print("⏳ Prompt queued for analysis...\n")
-
+            print("\n🎤 LISTENING …")
+            with mic as source:
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=sr_phrase)
+            txt = recognizer.recognize_google(audio, language="en-US")
+            text = txt+"""
+            1. Use only numbers and alphabets
+            2. Never use /,*,(,) instead replace it with words
+            3. Always use speakable words instead of characters that cant be pronounced 
+            4. Talk in a normal casual language
+            5. MOST IMP: DO NOT USE PHRASES SUCH AS HERES WHAT I SEE ETC             
+            """
+            print("✅ heard:", txt, "\n")
+            prompt_queue.put(txt)
         except sr.WaitTimeoutError:
-            print("⚠️  No speech detected (timeout)\n")
+            print("⚠️ timeout\n")
         except sr.UnknownValueError:
-            print("❌ Could not understand audio\n")
-        except sr.RequestError as e:
-            print(f"❌ Speech service error: {e}\n")
+            print("❌ unclear\n")
         except Exception as e:
-            print(f"❌ Unexpected voice error: {str(e)}\n")
+            print("❌ voice err:", e, "\n")
 
-
-def show_camera_feed_with_capture(capture_interval=60):
-    """Main camera loop with triple capture modes (auto, text, voice)"""
+# ---------- main loop ----------
+def main_loop(interval=60):
     global latest_frame
+    # auto-detect camera
+    for idx in range(3):
+        cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+        if cap.read()[0]:
+            print("Using camera", idx)
+            break
+        cap.release()
+    else:
+        sys.exit("No camera found")
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Could not open camera")
-        return
+    cv2.namedWindow("AI-Cam", cv2.WINDOW_NORMAL)
+    threading.Thread(target=terminal_thread, daemon=True).start()
+    threading.Thread(target=voice_thread, daemon=True).start()
 
-    cv2.namedWindow('Camera Feed', cv2.WINDOW_NORMAL)
-    cv2.startWindowThread()
-
-    # Start both input threads as daemons
-    input_thread = threading.Thread(target=terminal_input_thread, daemon=True)
-    voice_thread_instance = threading.Thread(target=voice_input_thread, daemon=True)
-
-    input_thread.start()
-    voice_thread_instance.start()
-
-    print(f"\n🎥 Camera feed started. Press 'q' in camera window to quit.")
-    print(f"📸 Auto-capture every {capture_interval} seconds")
-    print(f"⌨️  Terminal input: Type prompts or 'v' for voice mode\n")
-
-    last_capture_time = time.time() - capture_interval
-    photo_count = 0
+    last = time.time() - interval
+    count = 0
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Could not read frame")
-            break
-
+        ok, frame = cap.read()
+        if not ok:
+            print("camera read fail"); break
         with frame_lock:
             latest_frame = frame.copy()
+        cv2.imshow("AI-Cam", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-        cv2.imshow('Camera Feed', frame)
-        cv2.waitKey(1)
+        now = time.time()
 
-        current_time = time.time()
-
-        # Process any pending user prompts
+        # on-demand prompt
         try:
-            user_prompt = prompt_queue.get_nowait()
-
-            filename = f"on_demand_{int(current_time)}.jpg"
-
-            # Resize and save frame
+            pr = prompt_queue.get_nowait()
+            fname = f"on_demand_{int(now)}.jpg"
             with frame_lock:
-                resized_frame = cv2.resize(latest_frame, (TARGET_WIDTH, TARGET_HEIGHT))
-                cv2.imwrite(filename, resized_frame)
-
-            print(f"\n🔍 [ON-DEMAND] {filename}")
-            description = analyze_frame(filename, prompt=user_prompt)
-            print(f"🤖 [ON-DEMAND] {description}\n")
-
-            # TTS for on-demand
-            engine.say(description)
-            engine.runAndWait()
-
+                cv2.imwrite(fname, cv2.resize(latest_frame, (TARGET_W, TARGET_H)))
+            print("\n" + "="*60)
+            print("🔍 ON-DEMAND:", fname)
+            resp = analyse(fname, pr)
+            print("🤖", resp)
+            print("="*60 + "\n")
+            tts.speak(resp)
         except queue.Empty:
             pass
 
-        # Auto-capture if interval has passed
-        if current_time - last_capture_time >= capture_interval:
-            filename = f"capture_{photo_count:03d}.jpg"
-
-            # Resize and save frame
-            resized_frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
-            cv2.imwrite(filename, resized_frame)
-
-            print(f"\n📸 [AUTO] {filename}")
-            description = analyze_frame(filename, prompt="Describe what you see in three descriptive sentences")
-            print(f"🤖 [AUTO] {description}\n")
-
-            # TTS for auto-capture (THIS WAS MISSING!)
-            engine.say(description);
-            engine.runAndWait()
-
-            last_capture_time = current_time
-            photo_count += 1
-
-        time.sleep(0.001)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("\n🚪 Quitting camera feed...")
-            break
+        # auto-capture
+        if now - last >= interval:
+            fname = f"auto_{count:03d}.jpg"
+            cv2.imwrite(fname, cv2.resize(frame, (TARGET_W, TARGET_H)))
+            print("\n📸 AUTO:", fname)
+            resp = analyse(fname, "No filler just pure answer in 2 sentence answer what you see no formatting nothing")
+            print("🤖", resp, "\n")
+            tts.speak(resp)
+            last = now; count += 1
 
     cap.release()
     cv2.destroyAllWindows()
-    print(f"✅ Camera feed stopped. Total auto-captures: {photo_count}")
-
+    print("👋 AI-Cam stopped")
 
 if __name__ == "__main__":
-    show_camera_feed_with_capture()
+    main_loop()
